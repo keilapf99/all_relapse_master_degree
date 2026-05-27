@@ -1,0 +1,209 @@
+# Title : Differential Expression Analysis in childhood ALL relapse
+# Author: Keila Adonai Pérez-Fuentes
+# Date: May 27th 2025
+# Objective: This script performs a differential expression analysis using DESeq2
+# between two different phenotypes, ALL no relapse vs ALL relapse and also explore the 
+# probably sex effect, female and male, to identify any significant differences
+# that could help explain the mechanisms of relapse
+
+# --------------------------- PACKAGES -----------------------------------------
+#if (!require("BiocManager", quietly = TRUE))
+#  install.packages("BiocManager")
+#BiocManager::install("DESeq2")
+#BiocManager::install("org.Hs.eg.db")
+library(ggrepel)
+library(DESeq2)
+library(dplyr)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# --------------------------------- DATA ---------------------------------------
+counts_lla <- read.table("~/Desktop/aperez/all_relapse_masters_degree/0_raw_data//raw_matrix.tsv",
+                         sep = "\t",
+                         header = T,
+                         check.names = F)
+metadata <- read.table("~/Desktop/aperez/all_relapse_masters_degree/0_raw_data/metadata_NS500560.tsv", 
+                       header = T, 
+                       sep = "\t")
+
+# --------------------------- STEP 1. Input files ------------------------------
+# Prepare the data into the input files needed
+# The counts data need to match with the metadata names
+# 1.1 Numeric matrix -----------------------------------------------------------
+counts <- as.matrix(counts_lla)
+class(counts)
+unique(sapply(counts, class))
+
+# 1.2 Verify identical samples order -------------------------------------------
+rownames(metadata) <- metadata$sample
+counts <- counts[, rownames(metadata), drop = FALSE]
+stopifnot(identical(colnames(counts), rownames(metadata)))
+identical(colnames(counts), rownames(metadata))
+
+# 1.3 Convert the metadata into factors to log2fc be calculating correctly -----
+# Level 1 = Reference
+# Level 2 = Comparison 
+metadata$relapse <- factor(metadata$relapse, levels = c("no", "si")) 
+
+# ---------------------- STEP 2. Create dds object -----------------------------
+dds_relapse <- DESeqDataSetFromMatrix(countData = counts,
+                                      colData = metadata, 
+                                      design = ~relapse)
+
+# 2.1 Preprocessing ------------------------------------------------------------
+
+# Filtering out lowly expressed genes
+keep <- rowSums(counts(dds_relapse) >= 10) >= 15 #at least the nsample of your smaller group
+dds_relapse <- dds_relapse[keep, ]
+
+# 2.2 Differential expression --------------------------------------------------
+dds_relapse <- DESeq(dds_relapse)
+
+# ---------------------- STEP 3. Obtain the results ----------------------------
+# Note: it is important the order of the comparison 
+# Example = res <- results(dds, contrast=c("condition", "comparison", "reference"))
+# 3.1 Data frame with the complete differential expression signature -----------
+res <- results(dds_relapse, contrast=c("relapse", "si", "no"))
+res_padj_order <- res[order(res$padj),]
+res_order <- data.frame(res_padj_order) # this one 
+head(res_order)
+dim(res_order)
+
+# 3.2 Filter by |log2FC| > 1 and FDR < 0.05 ------------------------------------
+res_subset <- subset(res, abs(res$log2FoldChange) >= 1)
+res_subset <- subset(res_subset, res_subset$padj < 0.05)
+res_subset <- res_subset[order(res_subset$log2FoldChange),]
+res_filter_order <- data.frame(res_subset) # this one
+dim(res_filter_order)
+
+# 3.3 Change to gene_symbol ---------------------------------------------------- 
+gsymbols_order <- mapIds(org.Hs.eg.db, keys = rownames(res_order), 
+                   keytype = "ENSEMBL", 
+                   column = "SYMBOL")
+gsymbols_filter_order <- mapIds(org.Hs.eg.db, keys = rownames(res_filter_order), 
+                   keytype = "ENSEMBL", 
+                   column = "SYMBOL")
+
+res_order_gsymbols <- bind_cols(gsymbols_order, res_order)
+dim(res_order_gsymbols)
+#[1] 17044     7
+res_filter_order_gsymbols <-bind_cols(gsymbols_filter_order, res_filter_order)
+dim(res_filter_order_gsymbols)
+#[1] 298   7
+
+colnames(res_order_gsymbols)[1] <- "gene_symbol"
+res_order_gsymbols # differential expression signature 
+colnames(res_filter_order_gsymbols)[1] <- "gene_symbol"
+res_filter_order_gsymbols # degs
+
+res_order_gsymbols <- res_order_gsymbols[!is.na(res_order_gsymbols$gene_symbol), ] 
+dim(res_order_gsymbols) # save
+#[1] 14221     7
+res_filter_order_gsymbols <- res_filter_order_gsymbols[!is.na(res_filter_order_gsymbols$gene_symbol),]
+dim(res_filter_order_gsymbols) # save
+#[1] 237   7
+
+# ----------------------------- STEP 4. Plots ----------------------------------
+# 4.1 Label regulation direction -----------------------------------------------
+res_order_gsymbols$Type <- ifelse(
+  res_order_gsymbols$log2FoldChange > 1 & res_order_gsymbols$padj < 0.05,
+  "Sobreexpresados",
+  ifelse(
+    res_order_gsymbols$log2FoldChange < -1 & res_order_gsymbols$padj < 0.05,
+    "Subexpresados",
+    "No significativos"
+  )
+)
+
+# 4.2 Edit design -------------------------------------------------------------
+res_order_gsymbols_ns <- res_order_gsymbols %>%
+  filter(Type != "Not Significant")
+
+gene_counts <- table(res_order_gsymbols$Type)
+
+color_labels <- c(
+  paste0("Sobreexpresados (", gene_counts["Sobreexpresados"], ")"),
+  paste0("Subexpresados (", gene_counts["Subexpresados"], ")"),
+  paste0("No significativos (", gene_counts["No significativos"], ")")
+)
+
+names(color_labels) <- c("Sobreexpresados", "Subexpresados", "No significativos")
+top_genes <- res_order_gsymbols %>%
+  filter(Type != "No significativos") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  slice_head(n = 25)
+
+# 4.3 Volcano plot -------------------------------------------------------------
+volcano_plot <- ggplot(
+  res_order_gsymbols,
+  aes(x = log2FoldChange, y = -log10(padj), color = Type)
+) +
+  geom_point(aes(alpha = Type), size = 2.5)+
+  
+  scale_alpha_manual(values = c(
+    "No significativos" = 0.25,
+    "Sobreexpresados" = 0.9,
+    "Subexpresados" = 0.9
+  )) + 
+  guides(alpha = "none") +
+  geom_text_repel(
+    data = top_genes,
+    aes(label = gene_symbol),
+    color = "black",
+    size = 3.5,
+    box.padding = 0.4,
+    point.padding = 0.3,
+    segment.color = "black",
+    segment.size = 0.3,
+    max.overlaps = 50
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Sobreexpresados" = "#E64B35",
+      "Subexpresados" = "#4DBBD5",
+      "No significativos" = "grey"
+    ),
+    labels = color_labels
+  ) +
+  
+  labs(
+    title = "Genes diferencialmente expresados al diagnóstico",
+    subtitle = "recaída vs no recaída",
+    x = expression(log[2]~Fold~Change),
+    y = expression(-log[10]~valor~p~ajustado),
+    color = NULL
+  ) +
+  
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5, face = "bold.italic"),
+    plot.subtitle = element_text(size = 15, hjust = 0.5, face = "italic"),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black")
+  ) +
+  
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey90") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray90")
+
+volcano_plot
+
+# ------------------------------- STEP 5. Save ---------------------------------
+write.table(res_filter_order_gsymbols, file = "DEA_totales_relapse.tsv",
+            sep = "\t", 
+            quote = F,
+            col.names = T)
+write.table(res_filter_order_gsymbols, file = "DEGS_significant_relapse.tsv",
+            sep = "\t", 
+            quote = F,
+            col.names = T)
+write.table(top_genes, file = "top_genes_25_logfc.tsv",
+            sep = "\t", 
+            quote = F,
+            col.names = T)
+ggsave("DEA_relapse_vp.png", volcano_plot, width = 11, height = 7, dpi = 300)
